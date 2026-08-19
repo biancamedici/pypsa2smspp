@@ -179,4 +179,4 @@ docs/examples/output
 .vscode/*
 
 # PyCharm
-.idea/*
+.idea/
