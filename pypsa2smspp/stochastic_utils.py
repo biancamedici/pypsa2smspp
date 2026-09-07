@@ -213,7 +213,7 @@ def _normalize_stochastic_parameters(
     """
     sp = dict(stochastic_parameters or {})
 
-    stochastic_type = sp.get("stochastic_type", None)
+    stochastic_type = sp.get("stochastic_type", "tssb")
     parameters = sp.get("parameters", [])
 
     if parameters is None:
