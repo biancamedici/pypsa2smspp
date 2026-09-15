@@ -943,6 +943,9 @@ class Transformation:
         solution_data = {}
 
         if self.problem_structure.get("is_stochastic", False):
+            if self.problem_structure.get("stochastic_type") == "sddp":
+                return self._parse_sddp_solution_to_unitblocks(solution, n, solution_data)
+
             return self._parse_stochastic_solution_to_unitblocks(solution, n, solution_data)
 
         return self._parse_deterministic_solution_to_unitblocks(solution, n, solution_data)
@@ -1379,6 +1382,9 @@ class Transformation:
             A PyPSA network instance from which the data will be extracted.
         """
         if self.problem_structure.get("is_stochastic", False):
+            if self.problem_structure.get("stochastic_type") == "sddp":
+                self._inverse_transformation_sddp(objective_smspp, n)
+
             self._inverse_transformation_stochastic(objective_smspp, n)
         else:
             self._inverse_transformation_deterministic(objective_smspp, n)
@@ -1533,6 +1539,28 @@ class Transformation:
         # --------------------------------------------------
         if self.problem_structure.get("is_stochastic", False):
             stochastic_type = self.problem_structure.get("stochastic_type", None)
+
+            # --------------------------------------------------
+            # SDDP branch
+            # --------------------------------------------------
+            # SDDP ha una struttura top-level completamente diversa da TSSB:
+            #   SDDPBlock
+            #   ├── AbstractPath
+            #   ├── StochasticBlock_0 -> BendersBlock -> BendersBFunction -> Block(filename)
+            #   ├── StochasticBlock_1 -> ...
+            #   └── ...
+            #
+            # NON annidiamo un UCBlock al top-level: ogni stadio ha il proprio
+            # UCBlock salvato in un file .nc4 separato, referenziato via filename.
+            #
+            # Per questo, dopo aver costruito l'SDDPBlock, usciamo immediatamente
+            # dalla funzione: NON dobbiamo eseguire la logica deterministica
+            # (InvestmentBlock / UCBlock) che segue.
+
+            if stochastic_type == "sddp":
+                self.convert_to_sddp_block(master, index_id=0, name_id="Block_0")
+                self.sms_network = sn
+                return sn
 
             if stochastic_type != "tssb":
                 raise ValueError(
@@ -2020,13 +2048,18 @@ class Transformation:
         if self.problem_structure.get("is_stochastic", False):
             stochastic_type = self.problem_structure.get("stochastic_type", None)
 
-            if stochastic_type != "tssb":
+            if stochastic_type == "sddp":
+                block_type = "SDDPBlock"
+                inner_block_name = "Block_0"
+
+            elif stochastic_type == "tssb":
+                block_type = "TwoStageStochasticBlock"
+                inner_block_name = "Block_0"
+
+            else:
                 raise ValueError(
                     f"Unsupported stochastic_type in optimize: {stochastic_type!r}"
                 )
-
-            block_type = "TwoStageStochasticBlock"
-            inner_block_name = "Block_0"
 
         elif self.problem_structure.get("has_investment_block", False):
             block_type = "InvestmentBlock"
@@ -2039,6 +2072,9 @@ class Transformation:
         # --------------------------------------------------
         # Resolve configfile/template
         # --------------------------------------------------
+
+        # TODO: non esiste template di default per SDDP, quindi l'utente deve fornire un configfile esplicito?
+
         default_template_map = {
             "UCBlock": "UCBlock/uc_solverconfig.txt",
             "InvestmentBlock": "InvestmentBlock/BSPar.txt",
@@ -2180,6 +2216,18 @@ class Transformation:
                             f"Stochastic parameter {parameter!r} requires "
                             "enable_thermal_units=True."
                         )
+            if self.problem_structure["stochastic_type"] == "sddp":
+                # Verifichiamo che ci sia un modo per definire gli stadi
+                periods = self.stochastic_parameters["periods"]
+                investment_periods = getattr(n, "investment_periods", None)
+                has_investment_periods = (
+                        investment_periods is not None and len(investment_periods) > 0
+                )
+                if not periods and not has_investment_periods:
+                    raise ValueError(
+                        "Per SDDP è necessario specificare 'periods' in stochastic_parameters "
+                        "oppure usare un PyPSA network con investment_periods"
+                    )
 
         return True
 
@@ -2204,10 +2252,7 @@ class Transformation:
             return None
 
         if self.problem_structure.get("stochastic_type") != "tssb":
-            raise ValueError(
-                f"prepare_tssb_interface only supports 'tssb', got "
-                f"{self.problem_structure.get('stochastic_type')!r}."
-            )
+            return None
 
         #TODO build demand node by node instead of node0, node1, node0, node1
         dss_data = self.build_tssb_dss(n)
@@ -2531,32 +2576,348 @@ class Transformation:
 
     def prepare_sddp_interface(self, n):
         """
-        stub temporaneo
+        Questa funzione popola self.sddp_data con le informazioni necessarie
+        per costruire un SDDPBlock (attualmente minimale, poi da arricchire)
+
+        TODO: ampliare. Per ora supportiamo solo uno stadio, nessun scenario e nessuna variabile di stato
         """
-        raise NotImplementedError(
-            "prepare_sddp_interface is not implemented yet (Fase 1+)."
-        )
+        if not self.problem_structure.get("is_stochastic", False):
+            return None
+
+        if self.problem_structure.get("stochastic_type") != "sddp":
+            return None
+
+        # Normalizziamo subito i parametri
+        sddp_parameters = mu.normalize_sddp_parameters(self.stochastic_parameters)
+
+        # Otteniamo i nomi degli stadi
+        stage_names = mu.get_sddp_stage_names(n, sddp_parameters)
+
+        # Otteniamo gli snapshot per ogni stadio
+        # ATTENZIONE: per ora un solo stadio con tutti gli snapshot
+        all_snapshots = pd.Index(n.snapshots)
+
+        # Lista dei parametri stocastici da processare
+        stochastic_parameters = sddp_parameters["parameters"]
+
+        stage_data_list = []
+
+        for stage_name in stage_names:
+            # Per ora ogni stadio usa tutti gli snapshot
+            stage_snapshots = all_snapshots
+
+            # Estraiamo i dati di tutti i parametri stocastici per questo stadio
+            stage_data = mu.build_sddp_stage_data(
+                n=n,
+                stage_name=stage_name,
+                stage_snapshots=stage_snapshots,
+                stochastic_parameters=stochastic_parameters,
+                intermittent_carriers=self.intermittent_carriers,
+                default_intermittent_carriers=renewable_carriers,
+                enable_thermal_units=self.enable_thermal_units,
+                transformation_config=self.config,
+            )
+
+            # Uniamo le parti in un unico vettore di scenario per questo stadio
+            stage_merged = mu.merge_sddp_stage_data(
+                stage_data["parts"],
+                stage_name=stage_data["stage"],
+            )
+
+            stage_data_list.append(stage_merged)
+
+        # Costruiamo la matrice globale degli scenari
+        scenarios_info = mu.build_sddp_scenarios(stage_data_list)
+        # Calcoliamo le dimensioni per il costruttore di SDDPBlock
+        dimensions = mu.build_sddp_dimensions(stage_data_list, scenarios_info)
+
+        self.sddp_data = {
+            "stage_names": stage_names,
+            "stage_data_list": stage_data_list,
+            "scenarios_info": scenarios_info,
+            "dimensions": dimensions,
+        }
+
+        return self.sddp_data
 
     def convert_to_sddp_block(self, master, index_id, name_id):
         """
-        Aggiungiamo un SDDPBlock ad una rete SMS++
+        Aggiunge un SDDPBlock alla rete SMS++ (versione minimale).
 
-        Struttura finale:
+        Struttura costruita (per ogni stadio):
             SDDPBlock
-            ├── AbstractPath
+            ├── AbstractPath                    (per ora vuoto)
             ├── StochasticBlock_0
-            │     └── BendersBlock
-            │           └── BendersBFunction
-            │                 └── UCBlock_0
+            │     ├── AbstractPath              (per ora vuoto)
+            │     ├── DataType, FunctionName, Caller, SetSize, SetElements (vuote)
+            │     └── Block
+            │           └── BendersBlock
+            │                 └── BendersBFunction
+            │                       ├── AbstractPath (interno)
+            │                       └── Block       (segnaposto con id e filename)
             ├── StochasticBlock_1
             │     └── ...
             └── ...
 
-        For now this is a stub.
+        IMPORTANTE: non costruiamo davvero l'UCBlock dentro il BendersBlock.
+        Inseriamo solo un Block vuoto con attributi "id" e "filename" che
+        puntano al file .nc4 dove vive l'UCBlock di quello stadio. Sarà il
+        solver (SDDPSolver) a caricarlo.
         """
-        raise NotImplementedError(
-            "convert_to_sddp_block is not implemented yet (Fase 1+)."
+        # -----------------------------------------------------------------
+        # 0. Recupera i dati preparati da prepare_sddp_interface
+        # -----------------------------------------------------------------
+        sddp_data = self.sddp_data
+        dimensions = sddp_data["dimensions"]
+        scenarios_info = sddp_data["scenarios_info"]
+        stage_names = sddp_data["stage_names"]
+
+        # Numero di stadi (= TimeHorizon dell'SDDPBlock)
+        time_horizon = dimensions["TimeHorizon"]
+
+        # Verifichiamo che i nomi degli stadi e il TimeHorizon coincidano
+        # Se non coincidono, significa che prepare_sddp_interface e build_sddp_dimensions
+        # si sono disallineati
+        if len(stage_names) != time_horizon:
+            raise ValueError(
+                f"Numero di stadi incoerente: {len(stage_names)} nomi di stadio "
+                f"({list(stage_names)}) contro TimeHorizon={time_horizon}"
+            )
+
+        # -----------------------------------------------------------------
+        # 1. Costruzione delle dimensioni dell'SDDPBlock
+        # -----------------------------------------------------------------
+        # Ogni "Dimension" del blocco SDDPBlock. I valori vengono da
+        # build_sddp_dimensions(); usiamo int() per garantire che siano scalari.
+        sddp_dim_kwargs = {
+            "NumPolyhedralFunctionsPerSubBlock": Dimension(
+                "NumPolyhedralFunctionsPerSubBlock",
+                int(dimensions.get("NumPolyhedralFunctionsPerSubBlock", 1)),
+            ),
+            "TimeHorizon": Dimension("TimeHorizon", int(time_horizon)),
+            "NumSubBlocksPerStage": Dimension(
+                "NumSubBlocksPerStage",
+                int(dimensions["NumSubBlocksPerStage"]),
+            ),
+            "NumberScenarios": Dimension(
+                "NumberScenarios",
+                int(dimensions["NumberScenarios"]),
+            ),
+            "ScenarioSize": Dimension(
+                "ScenarioSize",
+                int(dimensions["ScenarioSize"]),
+            ),
+            "SubScenarioSize": Dimension(
+                "SubScenarioSize",
+                int(dimensions["SubScenarioSize"]),
+            ),
+            "NumberRandomDataGroups": Dimension(
+                "NumberRandomDataGroups",
+                int(dimensions["NumberRandomDataGroups"]),
+            ),
+            "AdmissibleStateSize": Dimension(
+                "AdmissibleStateSize",
+                int(dimensions["AdmissibleStateSize"]),
+            ),
+            "InitialStateSize": Dimension(
+                "InitialStateSize",
+                int(dimensions["InitialStateSize"]),
+            ),
+        }
+
+        # -----------------------------------------------------------------
+        # 2. Preparazione degli array che diventano Variabili dell'SDDPBlock
+        # -----------------------------------------------------------------
+        # Matrice Scenarios: forma (NumberScenarios, ScenarioSize).
+        # Se per qualche motivo non ha 2 dimensioni, la ridefiniamo con la
+        # forma attesa usando i valori delle dimensioni.
+        scenarios_arr = np.asarray(scenarios_info["scenarios"], dtype=float)
+        if scenarios_arr.ndim != 2:
+            scenarios_arr = scenarios_arr.reshape(
+                int(dimensions["NumberScenarios"]),
+                int(dimensions["ScenarioSize"]),
+            )
+
+        # Dimensione dei "random data groups": lista di interi per ogni stadio.
+        size_random_data_groups_arr = np.asarray(
+            dimensions["SizeRandomDataGroups"], dtype=np.uint32
         )
+
+        # StateSize può essere uno scalare o un array; lo trattiamo come scalare
+        # (nel notebook era np.array(3, dtype=uint32), quindi scalare).
+        state_size_val = dimensions["StateSize"]
+        if isinstance(state_size_val, np.ndarray):
+            # Se è già un array, prendiamo il primo valore (caso scalare).
+            state_size_arr = np.array(int(state_size_val.reshape(-1)[0]), dtype=np.uint32)
+        else:
+            state_size_arr = np.array(int(state_size_val), dtype=np.uint32)
+
+        # InitialState e AdmissibleState: array 1D piatti
+        initial_state_arr = np.asarray(
+            dimensions["InitialState"], dtype=float
+        ).reshape(-1)
+        admissible_state_arr = np.asarray(
+            dimensions["AdmissibleState"], dtype=float
+        ).reshape(-1)
+
+        # -----------------------------------------------------------------
+        # 3. Variabili dell'SDDPBlock (Scenarios, SizeRandomDataGroups, ecc.)
+        # -----------------------------------------------------------------
+        sddp_var_kwargs = {
+            # SizeRandomDataGroups: dimensione dei gruppi stocastici per stadio
+            "SizeRandomDataGroups": Variable(
+                "SizeRandomDataGroups",
+                "u4",
+                ("NumberRandomDataGroups",),
+                size_random_data_groups_arr,
+            ),
+            # Scenarios: la matrice completa (tutti gli stadi concatenati)
+            "Scenarios": Variable(
+                "Scenarios",
+                "double",
+                ("NumberScenarios", "ScenarioSize"),
+                scenarios_arr,
+            ),
+            # StateSize: scalare (dimensione dello stato per stadio)
+            "StateSize": Variable(
+                "StateSize",
+                "u4",
+                (),
+                state_size_arr,
+            ),
+            # AdmissibleState: concatenazione degli stati ammissibili finali
+            "AdmissibleState": Variable(
+                "AdmissibleState",
+                "double",
+                ("AdmissibleStateSize",),
+                admissible_state_arr,
+            ),
+            # InitialState: stato iniziale
+            "InitialState": Variable(
+                "InitialState",
+                "float",
+                ("InitialStateSize",),
+                initial_state_arr,
+            ),
+        }
+
+        # -----------------------------------------------------------------
+        # 4. Crea l'SDDPBlock e lo aggiunge al master (SMSNetwork o blocco padre)
+        # -----------------------------------------------------------------
+        # master.add("SDDPBlock", name_id, id=..., **dims, **vars) costruisce
+        # e registra il blocco con tutte le dimensioni/variabili passate.
+        master.add(
+            "SDDPBlock",
+            name_id,
+            id=f"{index_id}",
+            **sddp_dim_kwargs,
+            **sddp_var_kwargs,
+        )
+        # Recupera il riferimento al blocco appena creato
+        sddp_block = master.blocks[name_id]
+
+        # -----------------------------------------------------------------
+        # 5. AbstractPath dell'SDDPBlock (per ora vuoto)
+        # -----------------------------------------------------------------
+        # In futuro questo AbstractPath servirà per le PolyhedralFunction dello
+        # stage 0 (i tagli di Benders del futuro costo). Per ora è vuoto.
+        sddp_abstract_path = Block().from_kwargs(block_type="AbstractPath")
+        sddp_abstract_path.add_dimension("PathDim", 0)
+        sddp_abstract_path.add_dimension("TotalLength", 0)
+        sddp_block.add_block("AbstractPath", block=sddp_abstract_path)
+
+        # -----------------------------------------------------------------
+        # 6. Per ogni stadio, crea StochasticBlock + BendersBlock + BendersBFunction
+        # -----------------------------------------------------------------
+        for stage_idx in range(time_horizon):
+            # -------------------------------------------------------------
+            # 6a. Blocco interno (segnaposto con id e filename)
+            # -------------------------------------------------------------
+            # NON costruiamo l'UCBlock qui: creiamo solo un Block vuoto con
+            # attributi "id" e "filename". Il filename è il percorso del file
+            # .nc4 che contiene l'UCBlock dello stadio (che verrà creato in una
+            # fase successiva, o è già esistente nel workdir).
+            inner_block_filename = f"Block_{stage_idx}.nc4"
+            inner_block = Block().from_kwargs(
+                id=str(stage_idx),
+                filename=inner_block_filename,
+            )
+
+            # -------------------------------------------------------------
+            # 6b. BendersBFunction
+            # -------------------------------------------------------------
+            # Nel notebook ha dimensioni NumNonzero, NumVar, NumRow (per ora 0)
+            # e contiene un AbstractPath interno + il blocco segnaposto.
+            benders_b_func = Block().from_kwargs()
+            benders_b_func.add_dimension("NumNonzero", 0)
+            benders_b_func.add_dimension("NumVar", 0)
+            benders_b_func.add_dimension("NumRow", 0)
+
+            # AbstractPath interno della BendersBFunction (per ora vuoto)
+            benders_inner_path = Block().from_kwargs(block_type="AbstractPath")
+            benders_inner_path.add_dimension("PathDim", 0)
+            benders_inner_path.add_dimension("TotalLength", 0)
+            benders_b_func.add_block("AbstractPath", block=benders_inner_path)
+
+            # Aggiunge il blocco interno (segnaposto con filename)
+            benders_b_func.add_block("Block", block=inner_block)
+
+            # -------------------------------------------------------------
+            # 6c. BendersBlock (contiene BendersBFunction)
+            # -------------------------------------------------------------
+            benders_block = Block().from_kwargs(block_type="BendersBlock")
+            benders_block.add_dimension("NumVar", 0)
+            benders_block.add_block("BendersBFunction", block=benders_b_func)
+
+            # -------------------------------------------------------------
+            # 6d. StochasticBlock (AbstractPath + BendersBlock)
+            # -------------------------------------------------------------
+            # Per ora senza data mappings (NumberDataMappings = 0).
+            # In Fase 4 (scenari) riempiremo DataType, FunctionName, Caller,
+            # SetSize, SetElements e l'AbstractPath con i mapping reali.
+            stochastic_block = Block().from_kwargs(block_type="StochasticBlock")
+            stochastic_block.add_dimension("SetSizeSize", 0)
+            stochastic_block.add_dimension("SetElementsSize", 0)
+            stochastic_block.add_dimension("NumberDataMappings", 0)
+
+            # Variabili vuote (verranno riempite quando implementeremo gli scenari)
+            stochastic_block.add_variable(
+                "DataType", "S1", ("NumberDataMappings",),
+                np.array([], dtype="S1"),
+            )
+            stochastic_block.add_variable(
+                "FunctionName", "str", ("NumberDataMappings",),
+                np.array([], dtype="U50"),
+            )
+            stochastic_block.add_variable(
+                "Caller", "S1", ("NumberDataMappings",),
+                np.array([], dtype="S1"),
+            )
+            stochastic_block.add_variable(
+                "SetSize", "u4", ("SetSizeSize",),
+                np.array([], dtype=np.uint32),
+            )
+            stochastic_block.add_variable(
+                "SetElements", "u4", ("SetElementsSize",),
+                np.array([], dtype=np.uint32),
+            )
+
+            # AbstractPath dello StochasticBlock (per ora vuoto)
+            sb_abstract_path = Block().from_kwargs(block_type="AbstractPath")
+            sb_abstract_path.add_dimension("PathDim", 0)
+            sb_abstract_path.add_dimension("TotalLength", 0)
+            stochastic_block.add_block("AbstractPath", block=sb_abstract_path)
+
+            # Aggiunge il BendersBlock allo StochasticBlock
+            stochastic_block.add_block("Block", block=benders_block)
+
+            # Aggiunge lo StochasticBlock all'SDDPBlock con nome progressivo
+            sddp_block.add_block(
+                f"StochasticBlock_{stage_idx}", block=stochastic_block
+            )
+
+        # Restituisce il master (SMSNetwork), come fanno gli altri convert_*
+        return master
 
     def _parse_sddp_solution_to_unitblocks(self, solution, n, solution_data):
         """

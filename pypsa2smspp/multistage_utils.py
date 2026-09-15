@@ -174,7 +174,7 @@ def get_sddp_stage_names(n, stochastic_parameters=None) -> List[Any]:
 
     # Caso 2: fallback su investment_periods della rete
     investment_periods = getattr(n, "investment_periods", None)
-    if investment_periods:
+    if investment_periods is not None and len(investment_periods) > 0:
         return list(investment_periods)
 
     # Caso 3: nessuna informazione disponibile -> errore
