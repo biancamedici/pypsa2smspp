@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from openpyxl.styles.builtins import total
+
 import pypsa2smspp.stochastic_utils as su
 from pypsa2smspp.constants import STOCHASTIC_PARAMETER_REGISTRY
 
@@ -27,14 +29,13 @@ def normalize_sddp_parameters(
         {
             "stochastic_type": "sddp",
             "parameters": ["demand", "renewable_maxpower"],
-            "periods": [
-                {"name": "2020", "snapshots": ["2020-01-01 00:00:00", ...]},
-                {"name": "2021", "snapshots": ["2021-01-01 00:00:00", ...]},
-            ]
+            "snapshots_per_stage": 31
         }
 
-    La chiave "periods" è opzionale qui: se assente, verrà gestita altrove.
-    Se presente, deve avere una struttura valida.
+    L'utente fornisce solo il numero di snapshot per stadio
+    (`snapshots_per_stage`). La lista dei periodi (uno per stadio, ciascuno
+    con i suoi snapshot) viene derivata internamente da `make_sddp_periods`
+    a partire da `n.snapshots`.
 
     Returns
     -------
@@ -42,7 +43,7 @@ def normalize_sddp_parameters(
         Dizionario pulito con chiavi:
         - "stochastic_type": "sddp"
         - "parameters": lista di parametri stocastici validi
-        - "periods": lista di dizionari periodi normalizzati (o None se non forniti)
+        - "snapshots_per_stage": intero >= 1
     """
 
     sp = dict(stochastic_parameters or {})
@@ -77,58 +78,33 @@ def normalize_sddp_parameters(
             f"{sorted(valid_parameters)}."
         )
 
-    # Validazione "periods" (opzionale)
-    periods = sp.get("periods", None)
+    # Validazione snapshots_per_stage
+    snapshots_per_stage = sp.get("snapshots_per_stage", None)
 
-    if periods is not None:
-        if not isinstance(periods, (list, tuple)) or len(periods) == 0:
-            raise ValueError(
-                "Il campo 'periods' deve essere una lista non vuota di "
-                "dizionari con chiavi 'name' e 'snapshots'."
-            )
+    if snapshots_per_stage is None:
+        raise ValueError(
+            "SDDP richiede il campo 'snapshots_per_stage' in "
+            "stochastic_parameters: un intero >= 1 che indica quanti "
+            "snapshot della rete appartengono a ciascun stadio."
+        )
 
-        validated_periods = []
-        seen_names = set()
+    # bool è sottoclasse di int, quindi escludiamolo esplicitamente.
+    if isinstance(snapshots_per_stage, bool) or not isinstance(snapshots_per_stage, int):
+        raise ValueError(
+            f"'snapshots_per_stage' deve essere un intero, ricevuto "
+            f"{type(snapshots_per_stage).__name__} ({snapshots_per_stage!r})."
+        )
 
-        for idx, period in enumerate(periods):
-            if not isinstance(period, dict):
-                raise ValueError(
-                    f"L'elemento {idx} di 'periods' non è un dizionario."
-                )
-
-            name = period.get("name", None)
-            snapshots = period.get("snapshots", None)
-
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError(
-                    f"L'elemento {idx} di 'periods' deve avere un 'name' "
-                    "stringa non vuoto."
-                )
-
-            if name in seen_names:
-                raise ValueError(
-                    f"Nome duplicato in 'periods': {name!r}."
-                )
-            seen_names.add(name)
-
-            if snapshots is None or not isinstance(snapshots, (list, tuple)) or len(snapshots) == 0:
-                raise ValueError(
-                    f"Il periodo {name!r} deve avere una lista 'snapshots' "
-                    "non vuota."
-                )
-
-            # Verifichiamo che snapshots siano omogenei (opzionale per ora).
-            validated_periods.append({
-                "name": name,
-                "snapshots": list(snapshots),
-            })
-
-        periods = validated_periods
+    if snapshots_per_stage < 1:
+        raise ValueError(
+            f"'snapshots_per_stage' deve essere >= 1, ricevuto "
+            f"{snapshots_per_stage}."
+        )
 
     return {
         "stochastic_type": "sddp",
         "parameters": parameters,
-        "periods": periods,
+        "snapshots_per_stage": snapshots_per_stage,
     }
 
 
@@ -644,3 +620,57 @@ def build_sddp_dimensions(
     "InitialState": initial_state,
     "AdmissibleState": admissible_state,
 }
+
+def make_sddp_periods(
+        n,
+        snapshots_per_stage: int,
+        names: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Data una rete PyPSA n e un intero snapshots_per_stage, produrremo una lista di
+    periods - uno per stadio - ciascuno con un name e la lista degli snapshosts che
+    gli appartengono.
+    """
+    all_snapshots = pd.Index(n.snapshots)
+    total = len(all_snapshots)
+
+    if total == 0:
+        raise ValueError(
+            "La rete non ha snapshots."
+        )
+
+    if isinstance(snapshots_per_stage, bool) or not isinstance(snapshots_per_stage, int):
+        raise ValueError(
+            "Il parametro snapshots_per_stage deve essere un intero."
+        )
+    if snapshots_per_stage < 1:
+        raise ValueError(
+            "Il parametro snapshots_per_stage deve essere un intero POSITIVO."
+        )
+    if snapshots_per_stage > total:
+        raise ValueError(
+            f"snapshots_per_stage ({snapshots_per_stage}) non può superare il numero totale di snapshots ({total}) della rete."
+        )
+    if total % snapshots_per_stage != 0:
+        raise ValueError(
+            f"Il numero totale di snapshot ({total}) non è divisibile per il parametro "
+            f"snapshots_per_stage inserito dall'utente ({snapshots_per_stage}). "
+        )
+
+    num_stages = total // snapshots_per_stage
+    if names is not None and len(names) != num_stages:
+        raise ValueError(
+            f"names ({names}) non è della lunghezza corretta. Deve essere uguale a "
+            f"num_stages ({num_stages})."
+        )
+    if names is None:
+        names = [f"stage_{i}" for i in range(num_stages)]
+
+    periods = []
+
+    for i in range(num_stages):
+        start = i * snapshots_per_stage
+        end = start + snapshots_per_stage
+        periods.append({"name": str(names[i]), "snapshots": list(all_snapshots[start:end])})
+
+    return periods
