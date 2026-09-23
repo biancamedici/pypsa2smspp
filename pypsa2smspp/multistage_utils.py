@@ -33,9 +33,8 @@ def normalize_sddp_parameters(
             ]
         }
 
-    La chiave "periods" è opzionale qui: se assente, verrà gestita altrove
-    (es. usando `investment_periods` della rete). Se presente, deve avere
-    una struttura valida.
+    La chiave "periods" è opzionale qui: se assente, verrà gestita altrove.
+    Se presente, deve avere una struttura valida.
 
     Returns
     -------
@@ -138,16 +137,13 @@ def normalize_sddp_parameters(
 # Partizione in stadi
 # =================================================
 
-# TODO: capire come gestire questo pezzo
-
 def get_sddp_stage_names(n, stochastic_parameters=None) -> List[Any]:
     """
     Restituisce la lista ordinata dei nomi degli stadi SDDP.
 
     La fonte degli stadi è, nell'ordine:
       1. Il campo "periods" di `stochastic_parameters` (se fornito).
-      2. Altrimenti, `n.investment_periods` se presente.
-      3. Altrimenti, errore.
+      2. Altrimenti, errore.
 
     Questa funzione è importante per `transformation.py` perché determina
     quanti `StochasticBlock` creare nell'`SDDPBlock`.
@@ -172,12 +168,9 @@ def get_sddp_stage_names(n, stochastic_parameters=None) -> List[Any]:
     if periods:
         return [p["name"] for p in periods]
 
-    # Caso 2: fallback su investment_periods della rete
-    investment_periods = getattr(n, "investment_periods", None)
-    if investment_periods is not None and len(investment_periods) > 0:
-        return list(investment_periods)
+    # Attualmente non supportiamo investment_periods
 
-    # Caso 3: nessuna informazione disponibile -> errore
+    # Caso 2: nessuna informazione disponibile -> errore
     raise ValueError(
         "Per SDDP è necessario specificare 'periods' in stochastic_parameters "
         "oppure usare un PyPSA network con investment_periods."
@@ -558,16 +551,13 @@ def build_sddp_scenarios(stage_data_list: list[dict]) -> Dict[str, Any]:
         raise ValueError("stage_data_list non è conforme")
 
     ref_stage = stage_data_list[0]
-    sub_scenario_size_ref = ref_stage["sub_scenario_size"]
+    # Restituiremo poi una lista con un valore per ogni stadio
+    # SMS++ accetta che ogni stadio abbia valori diversi
+    sub_scenario_sizes = [stage["sub_scenario_size"] for stage in stage_data_list]
     pool_weights_ref = np.asarray(ref_stage["pool_weights"], dtype=float)
     number_scenarios_ref = ref_stage["scenarios"].shape[0]
 
     for stage in stage_data_list:
-        if stage["sub_scenario_size"] != sub_scenario_size_ref:
-            raise ValueError(
-                "Tutti gli stadi devono avere lo stesso SubScenarioSize."
-            )
-
         stage_pool_weights = np.asarray(stage["pool_weights"], dtype=float)
         if not np.allclose(stage_pool_weights, pool_weights_ref):
             raise ValueError(
@@ -587,7 +577,7 @@ def build_sddp_scenarios(stage_data_list: list[dict]) -> Dict[str, Any]:
         "scenarios": scenarios,
         "number_scenarios": number_scenarios_ref,
         "scenario_size": scenario_size,
-        "sub_scenario_size": sub_scenario_size_ref,
+        "sub_scenario_size": sub_scenario_sizes,
         "pool_weights": pool_weights_ref,
         # opzionale:
         "stage_names": [stage.get("stage") for stage in stage_data_list]
@@ -606,13 +596,25 @@ def build_sddp_dimensions(
     time_horizon = len(stage_data_list)
 
     # Estraiamo informazioni da scenarios_info
-    sub_scenario_size = scenarios_info["sub_scenario_size"]
+    sub_scenario_size = list(scenarios_info["sub_scenario_size"])
     number_scenarios = scenarios_info["number_scenarios"]
     scenario_size = scenarios_info["scenario_size"]
 
-    # Dimensione dei random data groups (costante tra stadi)
-    size_random_data_groups = stage_data_list[0]["size_random_data_groups"]
-    num_random_data_groups = len(size_random_data_groups)
+    # Determiniamo se tutti gli stadi hanno la stessa dimensione
+    uniform = len(set(sub_scenario_size)) == 1
+
+    if uniform:
+        # Caso uniforme: SubScenarioSize è scalare, i random data groups
+        # vengono letti normalmente.
+        sub_scenario_size_out = sub_scenario_size[0]
+        size_random_data_groups = stage_data_list[0]["size_random_data_groups"]
+        num_random_data_groups = len(size_random_data_groups)
+    else:
+        # Caso non uniforme: SubScenarioSize è un array di lunghezza TimeHorizon,
+        # e SMS++ ignora SizeRandomDataGroups (si usa un unico gruppo).
+        sub_scenario_size_out = np.asarray(sub_scenario_size, dtype=np.uint32)
+        size_random_data_groups = [scenario_size]
+        num_random_data_groups = 1
 
     # Gestione variabili di stato
     if state_info is None:
@@ -633,7 +635,7 @@ def build_sddp_dimensions(
     "NumSubBlocksPerStage": num_sub_blocks_per_stage,
     "NumberScenarios": number_scenarios,
     "ScenarioSize": scenario_size,
-    "SubScenarioSize": sub_scenario_size,
+    "SubScenarioSize": sub_scenario_size_out,
     "NumberRandomDataGroups": num_random_data_groups,
     "SizeRandomDataGroups": size_random_data_groups,
     "AdmissibleStateSize": admissible_state_size,
